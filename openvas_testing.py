@@ -340,7 +340,7 @@ def main():
             time.sleep(60)
             mac = get_vm_mac(vm)
             ip = find_ip_by_mac(mac)
-            target_id = get_or_create_target(vm, ip)  # 🔧 This line was missing
+            target_id = get_or_create_target(vm, ip)
             report_id = start_scan(target_id)
             download_reports(report_id, vm)
         except Exception as e:
@@ -350,4 +350,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
