@@ -39,11 +39,7 @@ def ssh_openvas_cmd(xml_cmd):
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     ssh.connect(OPENVAS_IP, username=OPENVAS_SSH_USER, password="Imegripe200408!")
     cmd = f"gvm-cli --gmp-username admin --gmp-password password socket --socketpath {SOCKET_PATH} --xml \"{xml_cmd}\""
-    stdin, stdout, stderr = ssh.exec_command(command, get_pty=True)
-
-    # Stream output in real time
-    for line in iter(stdout.readline, ""):
-        print(line, end="")
+    stdin, stdout, stderr = ssh.exec_command(cmd)
     output = stdout.read().decode()
     error = stderr.read().decode()
     ssh.close()
