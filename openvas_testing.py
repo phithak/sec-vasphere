@@ -61,9 +61,64 @@ def extract_id(xml, match=None):
         return None
     return matches[0]
 
-def extract_report_format_id(name):
+def extract_report_format_id(report_type):
     xml = ssh_openvas_cmd("<get_report_formats/>")
-    return extract_id(xml, match=name)
+    # Find all report_formats
+    format_blocks = re.findall(r'(<report_format .*?</report_format>)', xml, re.DOTALL)
+    for block in format_blocks:
+        # For PDF
+        if report_type.lower() == "pdf" and (
+            re.search(r'<extension>\s*pdf\s*</extension>', block, re.I) or
+            re.search(r'<content_type>\s*application/pdf\s*</content_type>', block, re.I)
+        ):
+            match = re.search(r'id="([a-f0-9\-]+)"', block)
+            if match:
+                return match.group(1)
+        # For XML
+        if report_type.lower() == "xml" and (
+            re.search(r'<extension>\s*xml\s*</extension>', block, re.I) or
+            re.search(r'<content_type>\s*text/xml\s*</content_type>', block, re.I)
+        ):
+            match = re.search(r'id="([a-f0-9\-]+)"', block)
+            if match:
+                return match.group(1)
+    return None
+    
+def extract_base64_report_content(raw_output):
+    """
+    Extract only the base64 content from the OpenVAS PDF report XML.
+    Looks for content after the last </report_format> before </report>.
+    """
+    match = re.search(r"</report_format>(.*?)</report>", raw_output, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return None
+    
+def get_full_and_fast_config_id():
+    configs_xml = ssh_openvas_cmd("<get_configs/>")
+    # Find all <config ...> ... </config> blocks
+    config_blocks = re.findall(r'(<config id="[^"]+".*?</config>)', configs_xml, re.DOTALL)
+    for block in config_blocks:
+        # Look for the <name>Full and fast</name> in each block
+        if re.search(r'<name>\s*Full and fast\s*</name>', block, re.IGNORECASE):
+            match = re.search(r'<config id="([a-f0-9\-]+)"', block)
+            if match:
+                return match.group(1)
+    raise Exception("Could not find 'Full and fast' config ID in OpenVAS.")
+    
+def get_port_list_id(preferred_name="All IANA assigned TCP and UDP"):
+    xml = ssh_openvas_cmd("<get_port_lists/>")
+    port_blocks = re.findall(r'(<port_list id="[^"]+".*?</port_list>)', xml, re.DOTALL)
+    for block in port_blocks:
+        if re.search(rf'<name>\s*{re.escape(preferred_name)}\s*</name>', block, re.I):
+            match = re.search(r'<port_list id="([a-f0-9\-]+)"', block)
+            if match:
+                return match.group(1)
+    # fallback to the first port list as last resort
+    match = re.search(r'<port_list id="([a-f0-9\-]+)"', xml)
+    if match:
+        return match.group(1)
+    return None
 
 # === VM Setup and Control ===
 def download_image_and_define_vm(target):
@@ -220,8 +275,7 @@ def get_or_create_target(name, ip):
         return existing_id
 
     # Create new target
-    port_lists_xml = ssh_openvas_cmd("<get_port_lists/>")
-    port_list_id = extract_id(port_lists_xml, match="OpenVAS Default") or extract_id(port_lists_xml, match="All IANA assigned TCP and UDP")
+    port_list_id = get_port_list_id("All IANA assigned TCP and UDP")
     if not port_list_id:
         raise Exception("[✗] No valid port list found.")
 
@@ -233,13 +287,8 @@ def get_or_create_target(name, ip):
     return target_id
 
 def start_scan(target_id):
-    # Get scan config ID
-    configs_xml = ssh_openvas_cmd("<get_configs/>")
-    config_id = extract_id(configs_xml, match="Full and fast")
-    if not config_id:
-        raise Exception("[✗] Could not find scan config 'Full and fast'")
-
-    print(f"[OpenVAS] Creating task for target image...")
+    config_id = get_full_and_fast_config_id()
+    print(f"[OpenVAS] Creating task for target image with config 'Full and fast' (id={config_id})...")
     task_xml = ssh_openvas_cmd(
         f"<create_task><name>image_scan</name><config id='{config_id}'/><target id='{target_id}'/></create_task>"
     )
@@ -250,16 +299,18 @@ def start_scan(target_id):
     print(f"[OpenVAS] Starting scan task ID: {task_id}")
     ssh_openvas_cmd(f"<start_task task_id='{task_id}'/>")
 
-    # Poll until scan completes
-    for _ in range(90):
+    # Infinite poll until scan completes
+    waited = 0
+    poll_interval = 10
+    while True:
         task_status_xml = ssh_openvas_cmd(f"<get_tasks task_id='{task_id}' details='1'/>")
+        print(task_status_xml)
         if "<status>Done</status>" in task_status_xml:
             print("[✓] Scan completed.")
             break
-        print("[*] Waiting for scan to finish...")
-        time.sleep(10)
-    else:
-        raise Exception("[✗] Scan did not finish in time.")
+        print(f"[*] Waiting for scan to finish... {waited//60} min elapsed")
+        time.sleep(poll_interval)
+        waited += poll_interval
 
     # Retry fetching report ID after scan is marked as Done
     for _ in range(5):
@@ -273,22 +324,21 @@ def start_scan(target_id):
 
     raise Exception("[✗] Failed to get report ID after scan.")
 
-
 def save_report(filename, content):
     with open(filename, "w") as f:
         f.write(content)
     os.chmod(filename, 0o644)
 
 def download_reports(report_id, vm_name):
-    for label, ext in [("PDF", "pdf"), ("XML", "xml")]:
+    for label, ext in [("pdf", "pdf"), ("xml", "xml")]:
         fmt_id = extract_report_format_id(label)
         if not fmt_id:
             print(f"[✗] Report format '{label}' not found.")
             continue
 
-        print(f"[OpenVAS] Downloading {label} report...")
+        print(f"[OpenVAS] Downloading {label.upper()} report...")
 
-        if label == "PDF":
+        if label == "pdf":
             xml_cmd = (
                 f"<get_reports report_id='{report_id}' "
                 f"format_id='{fmt_id}' "
@@ -301,28 +351,36 @@ def download_reports(report_id, vm_name):
 
         filename = f"{vm_name}_report.{ext}"
         try:
-            with open(filename, "wb" if label == "PDF" else "w") as f:
-                if label == "PDF":
-                    # Match base64 report content within XML
-                    match = re.search(r"<report[^>]*>(.*?)</report>", raw_output, re.DOTALL)
-                    if not match:
-                        print(f"[✗] Failed to extract {label} report content.")
-                        continue
-                    base64_data = match.group(1).strip()
+            if label == "pdf":
+                base64_data = extract_base64_report_content(raw_output)
+                if not base64_data:
+                    print(f"[x] Failed to extract {label.upper()} report content.")
+                    continue
 
-                    # Confirm it's a base64 string
-                    try:
-                        decoded = base64.b64decode(base64_data, validate=True)
+                # Save raw base64 for debugging
+                b64_filename = f"{vm_name}_report_base64.b64"
+                try:
+                    with open(b64_filename, "w") as b64_file:
+                        b64_file.write(base64_data)
+                    print(f"[✓] Saved raw base64 report to {b64_filename}")
+                except Exception as e:
+                    print(f"[x] Failed to save raw base64 report: {e}")
+
+                # Try decoding
+                try:
+                    decoded = base64.b64decode(base64_data, validate=True)
+                    with open(filename, "wb") as f:
                         f.write(decoded)
-                    except Exception as e:
-                        print(f"[✗] Failed to decode PDF: {e}")
-                        continue
-                else:
-                    # Save XML directly
+                    print(f"[✓] Saved {filename}")
+                except Exception as e:
+                    print(f"[✗] Failed to decode PDF: {e}")
+                    continue
+            else:
+                with open(filename, "w") as f:
                     f.write(raw_output)
-            print(f"[✓] Saved {filename}")
+                print(f"[✓] Saved {filename}")
         except Exception as e:
-            print(f"[✗] Failed to save {label}: {e}")
+            print(f"[✗] Failed to save {label.upper()}: {e}")
 
 # === Main ===
 def load_targets():
